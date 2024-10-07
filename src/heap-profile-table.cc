@@ -62,16 +62,8 @@
 #include "base/commandlineflags.h"
 #include "base/logging.h"
 #include "base/proc_maps_iterator.h"
-#include "base/sysinfo.h"
 #include "gperftools/malloc_hook.h"
 #include "gperftools/stacktrace.h"
-#include "symbolize.h"
-
-using std::sort;
-using std::equal;
-using std::copy;
-using std::string;
-using std::map;
 
 //----------------------------------------------------------------------
 
@@ -95,18 +87,7 @@ const char HeapProfileTable::kFileExt[] = ".heap";
 
 //----------------------------------------------------------------------
 
-static const int kHashTableSize = 179999;   // Size for bucket_table_.
-/*static*/ const int HeapProfileTable::kMaxStackDepth;
-
-//----------------------------------------------------------------------
-
-// We strip out different number of stack frames in debug mode
-// because less inlining happens in that case
-#ifdef NDEBUG
-static const int kStripFrames = 2;
-#else
-static const int kStripFrames = 3;
-#endif
+static constexpr int kHashTableSize = 179999;   // Size for bucket_table_.
 
 //----------------------------------------------------------------------
 
@@ -167,7 +148,7 @@ HeapProfileTable::Bucket* HeapProfileTable::GetBucket(int depth,
   for (Bucket* b = bucket_table_[buck]; b != 0; b = b->next) {
     if ((b->hash == h) &&
         (b->depth == depth) &&
-        equal(key, key + depth, b->stack)) {
+        std::equal(key, key + depth, b->stack)) {
       return b;
     }
   }
@@ -175,7 +156,7 @@ HeapProfileTable::Bucket* HeapProfileTable::GetBucket(int depth,
   // Create new bucket
   const size_t key_size = sizeof(key[0]) * depth;
   const void** kcopy = reinterpret_cast<const void**>(alloc_(key_size));
-  copy(key, key + depth, kcopy);
+  std::copy(key, key + depth, kcopy);
   Bucket* b = reinterpret_cast<Bucket*>(alloc_(sizeof(Bucket)));
   memset(b, 0, sizeof(*b));
   b->hash  = h;
@@ -185,12 +166,6 @@ HeapProfileTable::Bucket* HeapProfileTable::GetBucket(int depth,
   bucket_table_[buck] = b;
   num_buckets_++;
   return b;
-}
-
-int HeapProfileTable::GetCallerStackTrace(
-    int skip_count, void* stack[kMaxStackDepth]) {
-  return MallocHook::GetCallerStackTrace(
-      stack, kMaxStackDepth, kStripFrames + skip_count + 1);
 }
 
 void HeapProfileTable::RecordAlloc(
@@ -340,7 +315,7 @@ bool HeapProfileTable::WriteProfile(const char* file_name,
 void HeapProfileTable::CleanupOldProfiles(const char* prefix) {
   if (!FLAGS_cleanup_old_heap_profiles)
     return;
-  string pattern = string(prefix) + ".*" + kFileExt;
+  std::string pattern = std::string(prefix) + ".*" + kFileExt;
 #if defined(HAVE_GLOB_H)
   glob_t g;
   const int r = glob(pattern.c_str(), GLOB_ERR, nullptr, &g);
@@ -359,142 +334,4 @@ void HeapProfileTable::CleanupOldProfiles(const char* prefix) {
 #else   /* HAVE_GLOB_H */
   RAW_LOG(WARNING, "Unable to remove old heap profiles (can't run glob())");
 #endif
-}
-
-HeapProfileTable::Snapshot* HeapProfileTable::TakeSnapshot() {
-  Snapshot* s = new (alloc_(sizeof(Snapshot))) Snapshot(alloc_, dealloc_);
-  address_map_->Iterate([s] (const void* ptr, AllocValue* v) {
-    s->Add(ptr, *v);
-  });
-  return s;
-}
-
-void HeapProfileTable::ReleaseSnapshot(Snapshot* s) {
-  s->~Snapshot();
-  dealloc_(s);
-}
-
-HeapProfileTable::Snapshot* HeapProfileTable::NonLiveSnapshot(
-    Snapshot* base) {
-  RAW_VLOG(2, "NonLiveSnapshot input: %" PRId64 " %" PRId64 "\n",
-           total_.allocs - total_.frees,
-           total_.alloc_size - total_.free_size);
-
-  Snapshot* s = new (alloc_(sizeof(Snapshot))) Snapshot(alloc_, dealloc_);
-  address_map_->Iterate([&] (const void* ptr, AllocValue* v) {
-    if (v->live()) {
-      v->set_live(false);
-    } else {
-      if (base != nullptr && base->map_.Find(ptr) != nullptr) {
-        // Present in arg->base, so do not save
-      } else {
-        s->Add(ptr, *v);
-      }
-    }
-  });
-  RAW_VLOG(2, "NonLiveSnapshot output: %" PRId64 " %" PRId64 "\n",
-           s->total_.allocs - s->total_.frees,
-           s->total_.alloc_size - s->total_.free_size);
-  return s;
-}
-
-// Information kept per unique bucket seen
-struct HeapProfileTable::Snapshot::Entry {
-  int count;
-  size_t bytes;
-  Bucket* bucket;
-  Entry() : count(0), bytes(0) { }
-
-  // Order by decreasing bytes
-  bool operator<(const Entry& x) const {
-    return this->bytes > x.bytes;
-  }
-};
-
-void HeapProfileTable::Snapshot::ReportLeaks(const char* checker_name,
-                                             const char* filename,
-                                             bool should_symbolize) {
-  // This is only used by the heap leak checker, but is intimately
-  // tied to the allocation map that belongs in this module and is
-  // therefore placed here.
-  RAW_LOG(ERROR, "Leak check %s detected leaks of %zu bytes "
-          "in %zu objects",
-          checker_name,
-          size_t(total_.alloc_size),
-          size_t(total_.allocs));
-
-  // Group objects by Bucket
-  std::map<Bucket*, Entry> buckets;
-  map_.Iterate([&] (const void* ptr, AllocValue* v) {
-    Entry* e = &buckets[v->bucket()]; // Creates empty Entry first time
-    e->bucket = v->bucket();
-    e->count++;
-    e->bytes += v->bytes;
-  });
-
-  // Sort buckets by decreasing leaked size
-  const int n = buckets.size();
-  Entry* entries = new Entry[n];
-  int dst = 0;
-  for (map<Bucket*,Entry>::const_iterator iter = buckets.begin();
-       iter != buckets.end();
-       ++iter) {
-    entries[dst++] = iter->second;
-  }
-  std::sort(entries, entries + n);
-
-  // Report a bounded number of leaks to keep the leak report from
-  // growing too long.
-  const int to_report =
-      (FLAGS_heap_check_max_leaks > 0 &&
-       n > FLAGS_heap_check_max_leaks) ? FLAGS_heap_check_max_leaks : n;
-  RAW_LOG(ERROR, "The %d largest leaks:", to_report);
-
-  // Print
-  SymbolTable symbolization_table;
-  for (int i = 0; i < to_report; i++) {
-    const Entry& e = entries[i];
-    for (int j = 0; j < e.bucket->depth; j++) {
-      symbolization_table.Add(e.bucket->stack[j]);
-    }
-  }
-  if (should_symbolize)
-    symbolization_table.Symbolize();
-
-  {
-    auto do_log = +[] (const char* buf, size_t amt) {
-      RAW_LOG(ERROR, "%.*s", amt, buf);
-    };
-    constexpr int kBufSize = 2<<10;
-    tcmalloc::WriteFnWriter<decltype(do_log), kBufSize> printer{do_log};
-
-    for (int i = 0; i < to_report; i++) {
-      const Entry& e = entries[i];
-      printer.AppendF("Leak of %zu bytes in %d objects allocated from:\n",
-                      e.bytes, e.count);
-      for (int j = 0; j < e.bucket->depth; j++) {
-        const void* pc = e.bucket->stack[j];
-        printer.AppendF("\t@ %" PRIxPTR " %s\n",
-                        reinterpret_cast<uintptr_t>(pc), symbolization_table.GetSymbol(pc));
-      }
-    }
-  }
-
-  if (to_report < n) {
-    RAW_LOG(ERROR, "Skipping leaks numbered %d..%d",
-            to_report, n-1);
-  }
-  delete[] entries;
-
-  if (!HeapProfileTable::WriteProfile(filename, total_, &map_)) {
-    RAW_LOG(ERROR, "Could not write pprof profile to %s", filename);
-  }
-}
-
-void HeapProfileTable::Snapshot::ReportIndividualObjects() {
-  map_.Iterate([] (const void* ptr, AllocValue* v) {
-    // Perhaps also log the allocation stack trace (unsymbolized)
-    // on this line in case somebody finds it useful.
-    RAW_LOG(ERROR, "leaked %zu byte object %p", v->bytes, ptr);
-  });
 }

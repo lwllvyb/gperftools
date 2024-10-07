@@ -67,6 +67,7 @@
 #include "base/low_level_alloc.h"
 #include "base/sysinfo.h"      // for GetUniquePathFromEnv()
 #include "heap-profile-table.h"
+#include "malloc_backtrace.h"
 
 #ifndef	PATH_MAX
 #ifdef MAXPATHLEN
@@ -76,7 +77,7 @@
 #endif
 #endif
 
-using std::string;
+using tcmalloc::LowLevelAlloc;
 
 //----------------------------------------------------------------------
 // Flags that control heap-profiling
@@ -273,11 +274,18 @@ static void MaybeDumpProfileLocked() {
   }
 }
 
+//----------------------------------------------------------------------
+// Allocation/deallocation hooks for MallocHook
+//----------------------------------------------------------------------
+
 // Record an allocation in the profile.
-static void RecordAlloc(const void* ptr, size_t bytes, int skip_count) {
+static void NewHook(const void* ptr, size_t bytes) {
+  if (!ptr) return;
+
   // Take the stack trace outside the critical section.
-  void* stack[HeapProfileTable::kMaxStackDepth];
-  int depth = HeapProfileTable::GetCallerStackTrace(skip_count + 1, stack);
+  static constexpr int kDepth = 32;
+  void* stack[kDepth];
+  int depth = tcmalloc::GrabBacktrace(stack, kDepth, 1);
   SpinLockHolder l(&heap_lock);
   if (is_on) {
     heap_profile->RecordAlloc(ptr, bytes, depth, stack);
@@ -286,7 +294,9 @@ static void RecordAlloc(const void* ptr, size_t bytes, int skip_count) {
 }
 
 // Record a deallocation in the profile.
-static void RecordFree(const void* ptr) {
+static void DeleteHook(const void* ptr) {
+  if (!ptr) return;
+
   SpinLockHolder l(&heap_lock);
   if (is_on) {
     heap_profile->RecordFree(ptr);
@@ -295,24 +305,16 @@ static void RecordFree(const void* ptr) {
 }
 
 //----------------------------------------------------------------------
-// Allocation/deallocation hooks for MallocHook
-//----------------------------------------------------------------------
-
-// static
-void NewHook(const void* ptr, size_t size) {
-  if (ptr != nullptr) RecordAlloc(ptr, size, 0);
-}
-
-// static
-void DeleteHook(const void* ptr) {
-  if (ptr != nullptr) RecordFree(ptr);
-}
-
-//----------------------------------------------------------------------
 // Starting/stopping/dumping
 //----------------------------------------------------------------------
 
 extern "C" void HeapProfilerStart(const char* prefix) {
+  // A bit of a kludge. When we dump heap profiles on certain systems
+  // (e.g. FreeBSD), we'll invoke GetProgramInvocationName and it'll
+  // malloc. And we cannot malloc when under heap profiler lock(s). So
+  // lets do it now (it caches the name internally).
+  (void)tcmalloc::GetProgramInvocationName();
+
   SpinLockHolder l(&heap_lock);
 
   if (is_on) return;
@@ -325,7 +327,7 @@ extern "C" void HeapProfilerStart(const char* prefix) {
   // call new, and we want that to be accounted for correctly.
   MallocExtension::Initialize();
 
-  heap_profiler_memory = LowLevelAlloc::NewArena(nullptr);
+  heap_profiler_memory = LowLevelAlloc::NewArena();
 
   heap_profile = new(ProfilerMalloc(sizeof(HeapProfileTable)))
       HeapProfileTable(ProfilerMalloc, ProfilerFree);

@@ -9,7 +9,7 @@ ACLOCAL_AMFLAGS = -I m4
 AUTOMAKE_OPTIONS = subdir-objects
 
 # This is so we can #include <gperftools/foo>
-AM_CPPFLAGS = -I$(top_srcdir)/src
+AM_CPPFLAGS = -I$(top_srcdir)/src -I$(top_builddir)/src
 
 if !WITH_STACK_TRACE
 AM_CPPFLAGS += -DNO_TCMALLOC_SAMPLES
@@ -117,6 +117,9 @@ libcommon_la_SOURCES = src/base/logging.cc \
                        src/base/spinlock.cc \
                        src/base/spinlock_internal.cc
 
+noinst_LTLIBRARIES += liblow_level_alloc.la
+liblow_level_alloc_la_SOURCES = src/base/low_level_alloc.cc
+
 if MINGW
 libcommon_la_SOURCES += src/windows/port.cc \
                         src/windows/ia32_modrm_map.cc \
@@ -186,14 +189,12 @@ proc_maps_iterator_test_LDADD = libcommon.la libgtest.la
 
 if WITH_HEAP_PROFILER_OR_CHECKER
 TESTS += low_level_alloc_unittest
-low_level_alloc_unittest_SOURCES = src/base/low_level_alloc.cc \
-                                   src/malloc_hook.cc \
-                                   src/tests/low_level_alloc_unittest.cc
+low_level_alloc_unittest_SOURCES = src/tests/low_level_alloc_unittest.cc
 # By default, MallocHook takes stack traces for use by the heap-checker.
 # We don't need that functionality here, so we turn it off to reduce deps.
 low_level_alloc_unittest_CXXFLAGS = -DNO_TCMALLOC_SAMPLES $(AM_CXXFLAGS)
 low_level_alloc_unittest_CPPFLAGS = $(gtest_CPPFLAGS)
-low_level_alloc_unittest_LDADD = libcommon.la libgtest.la
+low_level_alloc_unittest_LDADD = liblow_level_alloc.la libcommon.la libgtest.la
 endif WITH_HEAP_PROFILER_OR_CHECKER
 
 ### ------- stack trace
@@ -276,7 +277,6 @@ MINIMAL_MALLOC_SRC = src/common.cc \
                      src/span.cc \
                      src/stack_trace_table.cc \
                      src/static_vars.cc \
-                     src/symbolize.cc \
                      src/thread_cache.cc \
                      src/thread_cache_ptr.cc \
                      src/malloc_hook.cc \
@@ -506,11 +506,29 @@ dist_doc_DATA += docs/overview.dot \
 
 if WITH_DEBUGALLOC
 
+noinst_LTLIBRARIES += libbacktrace.la
+libbacktrace_la_SOURCES = vendor/libbacktrace-integration/file-format.c \
+                          vendor/libbacktrace/dwarf.c \
+                          vendor/libbacktrace/fileline.c \
+                          vendor/libbacktrace/posix.c \
+                          vendor/libbacktrace/sort.c \
+                          vendor/libbacktrace/state.c \
+                          vendor/libbacktrace/read.c
+# note, we're not including our "usual" project-wide AM_CPPFLAGS here
+libbacktrace_la_CPPFLAGS = -I$(top_srcdir)/vendor/libbacktrace-integration \
+                           -I$(top_srcdir)/vendor/libbacktrace
+
+
+noinst_LTLIBRARIES += libsymbolize.la
+libsymbolize_la_SOURCES = src/symbolize.cc vendor/libbacktrace-integration/backtrace-alloc.cc
+libsymbolize_la_LIBADD = libbacktrace.la
+
 lib_LTLIBRARIES += libtcmalloc_minimal_debug.la
-libtcmalloc_minimal_debug_la_SOURCES = src/debugallocation.cc $(MINIMAL_MALLOC_SRC)
+libtcmalloc_minimal_debug_la_SOURCES = src/debugallocation.cc \
+                                       $(MINIMAL_MALLOC_SRC)
 libtcmalloc_minimal_debug_la_CXXFLAGS = $(libtcmalloc_minimal_la_CXXFLAGS)
 libtcmalloc_minimal_debug_la_LDFLAGS = $(libtcmalloc_minimal_la_LDFLAGS)
-libtcmalloc_minimal_debug_la_LIBADD = $(libtcmalloc_minimal_la_LIBADD)
+libtcmalloc_minimal_debug_la_LIBADD = libsymbolize.la liblow_level_alloc.la $(libtcmalloc_minimal_la_LIBADD)
 
 ### Unittests
 
@@ -621,7 +639,6 @@ endif !BUILD_EMERGENCY_MALLOC
 ### Making the library
 
 FULL_MALLOC_SRC = $(MINIMAL_MALLOC_SRC) \
-                  src/base/low_level_alloc.cc \
                   src/heap-profile-table.cc \
                   src/heap-profiler.cc \
                   $(EMERGENCY_MALLOC_CC) \
@@ -633,7 +650,7 @@ libtcmalloc_la_SOURCES = $(TCMALLOC_CC) $(FULL_MALLOC_SRC)
 libtcmalloc_la_CXXFLAGS = -DNDEBUG $(AM_CXXFLAGS) \
                           $(EMERGENCY_MALLOC_DEFINE)
 libtcmalloc_la_LDFLAGS = -version-info @TCMALLOC_SO_VERSION@ $(AM_LDFLAGS)
-libtcmalloc_la_LIBADD = libstacktrace.la libcommon.la
+libtcmalloc_la_LIBADD = libstacktrace.la liblow_level_alloc.la libcommon.la
 
 ### Unittests
 
@@ -652,7 +669,7 @@ tcm_asserts_unittest_SOURCES = src/tests/tcmalloc_unittest.cc \
 tcm_asserts_unittest_CXXFLAGS = $(AM_CXXFLAGS) \
                                 $(EMERGENCY_MALLOC_DEFINE)
 tcm_asserts_unittest_CPPFLAGS = $(gtest_CPPFLAGS)
-tcm_asserts_unittest_LDADD = libstacktrace.la libcommon.la libgtest.la
+tcm_asserts_unittest_LDADD = libstacktrace.la liblow_level_alloc.la libcommon.la libgtest.la
 
 # This makes sure it's safe to link in both tcmalloc and
 # tcmalloc_minimal.  (One would never do this on purpose, but perhaps
@@ -736,7 +753,7 @@ lib_LTLIBRARIES += libtcmalloc_debug.la
 libtcmalloc_debug_la_SOURCES = src/debugallocation.cc $(FULL_MALLOC_SRC)
 libtcmalloc_debug_la_CXXFLAGS = $(libtcmalloc_la_CXXFLAGS)
 libtcmalloc_debug_la_LDFLAGS = $(libtcmalloc_la_LDFLAGS)
-libtcmalloc_debug_la_LIBADD = $(libtcmalloc_la_LIBADD)
+libtcmalloc_debug_la_LIBADD = libsymbolize.la $(libtcmalloc_la_LIBADD)
 
 ### Unittests
 
@@ -955,4 +972,7 @@ EXTRA_DIST = $(SCRIPTS) \
 dist-hook: $(top_distdir)/ChangeLog
 	test -e "$(distdir)/vsprojects" \
 	   && chmod -R u+w $(distdir)/*.sln $(distdir)/vsprojects/
+	rm -rf $(distdir)/vendor/googletest/googletest/src/.deps
+	rm -rf $(distdir)/vendor/libbacktrace/.deps
+	rm -rf $(distdir)/vendor/libbacktrace-integration/.deps
 	rm -f $(distdir)/src/config.h $(distdir)/src/gperftools/tcmalloc.h
